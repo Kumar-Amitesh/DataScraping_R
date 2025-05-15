@@ -1,6 +1,6 @@
 ---
-title: "22BCE2130"
-author: "22BCE2130_Amitesh"
+title: "Data Scraping"
+author: "Amitesh"
 date: "2025-03-30"
 output: html_document
 ---
