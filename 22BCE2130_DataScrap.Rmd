@@ -1,0 +1,514 @@
+---
+title: "22BCE2130"
+author: "22BCE2130_Amitesh"
+date: "2025-03-30"
+output: html_document
+---
+
+```{r}
+library(rvest)
+library(httr)
+library(dplyr)
+library(tidyr)
+library(RedditExtractoR)
+library(ggplot2)
+library(stringi)
+library(stringr)
+library(syuzhet)
+library(udpipe)
+library(tidytext)
+library(reticulate)
+library(lubridate)
+library(jsonlite)
+library(tibble)
+```
+
+```{r}
+# Function to convert relative time to absolute timestamp and return date & time separately
+convert_relative_time <- function(time_str) {
+  match <- str_match(time_str, "(\\d+)\\s*(second|minute|hour|day|week|month|year)s?\\s*ago")
+  
+  if (is.na(match[1])) return(list(date = NA, time = NA))  # Return NA if no match
+  
+  num <- as.numeric(match[2])  # Extract number
+  unit <- match[3]  # Extract time unit
+  
+  # Get current system time
+  current_time <- Sys.time()
+  
+  # Adjust time based on extracted unit
+  adjusted_time <- switch(unit,
+                          "second" = current_time - seconds(num),
+                          "minute" = current_time - minutes(num),
+                          "hour"   = current_time - hours(num),
+                          "day"    = current_time - days(num),
+                          "week"   = current_time - weeks(num),
+                          "month"  = current_time - months(num),
+                          "year"   = current_time - years(num),
+                          current_time)  # Default to now if unit is unrecognized
+  
+  # Extract date and time separately
+  date_part <- format(adjusted_time, "%Y-%m-%d")  # Extract date
+  time_part <- format(adjusted_time, "%H:%M:%S")  # Extract 24-hour format time
+  
+  return(list(date = date_part, time = time_part))
+}
+
+```
+
+```{r}
+
+CATEGORY_KEYWORDS <- list(
+  "Politics" = c("government", "election", "minister", "law", "policy", "president"),
+  "Business" = c("market", "economy", "stocks", "finance", "trade"),
+  "Technology" = c("AI", "startup", "software", "cybersecurity", "data"),
+  "Sports" = c("football", "cricket", "tennis", "Olympics"),
+  "Health" = c("virus", "disease", "vaccine", "medical", "doctor", "WHO"),
+  "Entertainment" = c("movie", "music", "Hollywood", "Bollywood", "celebrity"),
+  "Science" = c("research", "NASA", "discovery", "experiment", "genetics")
+)
+
+extract_article_details_r <- function(url) {
+  tryCatch({
+    # Fetch the webpage content
+    page <- GET(url)
+    
+    # Parse the HTML content
+    content <- read_html(page)
+    
+    # Extract the article text
+    text <- content %>%
+      html_nodes("p") %>%
+      html_text() %>%
+      paste(collapse = " ")%>%
+      tolower()
+    
+    timeline <- content %>%
+      html_nodes("time") %>%
+      html_text() %>%
+      paste(collapse = " ") 
+    
+    absolute_time <- convert_relative_time(timeline)
+
+    author <- content %>%
+      html_nodes("span.sc-b42e7a8f-7.kItaYD") %>%
+      html_text() %>%
+      paste(collapse = " ") 
+    
+    if (text == "") {
+      return(list(category = "NA", summary = "NA", date = "NA", time = "NA", author = "NA"))
+    }
+    
+    # Extract a simple summary (first 2 sentences as a basic summary)
+    sentences <- unlist(strsplit(text, "(?<=[.!?])\\s+", perl = TRUE))
+    summary <- if (length(sentences) >= 2) {
+      paste(sentences[1:2], collapse = " ")
+    } else {
+      text
+    }
+    
+    # Determine category
+    for (category in names(CATEGORY_KEYWORDS)) {
+      if (any(str_detect(text, fixed(CATEGORY_KEYWORDS[[category]], ignore_case = TRUE)))) {
+        return(list(category = category, summary = summary, date = absolute_time$date, time = absolute_time$time, author = author))
+      }
+    }
+    
+    return(list(category = "NA", summary = summary, date = absolute_time$date, time = absolute_time$time, author = author))
+    
+  }, error = function(e) {
+    return(list(category = "NA", summary = "NA", date = "NA", time = "NA", author = "NA"))
+  })
+}
+
+```
+
+```{r}
+extract_longest_comment<-function(comments_df) {
+  if (is.null(comments_df) || nrow(comments_df) == 0) {
+    return(NA)  # Return NA instead of an empty string
+  }
+
+  longest_comment <- comments_df %>%
+    filter(nchar(comment) == max(nchar(comment), na.rm = TRUE)) %>%
+    slice(1) %>%  # Take the first if there are ties
+    pull(comment)
+
+  if (length(longest_comment) == 0 || is.na(longest_comment)) {
+    return(NA)  # Ensure the return type is always consistent
+  }
+
+  return(as.character(longest_comment))
+}
+
+```
+
+```{r}
+source('api.r')
+GEMINI_API_KEY <- GEMINI_API_KEY
+
+extract_article_details <- function(url) {
+  tryCatch({
+    # Define the API endpoint
+    api_url <- "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    
+    # Define prompt
+    prompt <- paste(
+      "Analyze the following news article available at the given URL and provide:\n",
+      "1. A brief summary of the article.\n",
+      "2. The category of the article or topic the article is realted to.\n",
+      "URL:", url, "\n",
+      "Format the response as:\n",
+      "Category: <category>\n",
+      "Summary: <summary>"
+    )
+    
+    # Request body
+    request_body <- list(
+      contents = list(
+        list(
+          parts = list(
+            list(text = prompt)
+          )
+        )
+      )
+    )
+    
+    # API Call
+    response <- httr::POST(
+      url = paste0(api_url, "?key=", Sys.getenv("GEMINI_API_KEY")),
+      body = jsonlite::toJSON(request_body, auto_unbox = TRUE),
+      encode = "json",
+      httr::content_type_json()
+    )
+    
+    # Parse response
+    response_content <- httr::content(response, as = "parsed", simplifyVector = TRUE)
+    
+    # Extract text output correctly
+    response_text <- response_content$candidates[[1]]$content$parts[[1]]$text
+    
+    # Initialize
+    category <- "NA"
+    summary <- "NA"
+    
+    # Extract category and summary
+    lines <- unlist(strsplit(response_text, "\n"))
+    
+    for (line in lines) {
+      if (grepl("^Category:", line)) {
+        category <- trimws(sub("Category: ", "", line))
+      } else if (grepl("^Summary:", line)) {
+        summary <- trimws(sub("Summary: ", "", line))
+      }
+    }
+    
+    # Check if API failed to return valid data
+    if (category == "NA" || summary == "NA") {
+      return(extract_article_details_r(url))
+    }
+    
+    return(list(category = category, summary = summary))
+    
+  }, error = function(e) {
+    return(extract_article_details_r(url))
+  })
+}
+
+```
+
+```{r}
+
+scrape_bbc_news <- function() {
+  urls <- c("https://www.bbc.com/news","https://www.bbc.com/sport","https://www.bbc.com/business",
+            "https://www.bbc.com/innovation","https://www.bbc.com/culture","https://www.bbc.com/arts",
+            "https://www.bbc.com/travel","https://www.bbc.com/earth")
+  
+  all_articles <- list()
+
+  for (url in urls) {
+    response <- GET(url, user_agent("Mozilla/5.0"))
+    page <- read_html(response)
+    
+    articles <- page %>% html_nodes("div.sc-c6f6255e-0.eGcloy")
+    
+    headlines <- articles %>% html_node("h2") %>% html_text()
+    links <- articles %>% html_node("a") %>% html_attr("href")
+    links <- ifelse(!is.na(links), paste0("https://www.bbc.com", links), "")
+    
+    categories <- articles %>% html_node(".gs-c-section-link") %>% html_text(trim = TRUE)
+    categories <- ifelse(is.na(categories), "Uncategorized", categories)
+    
+    # Get category and summary from function
+    extracted_data <- lapply(links, function(link) {
+      if (link != "") {
+        result <- extract_article_details_r(link) 
+        return(result)
+      } else {
+        return(c("NA", "NA"))
+      }
+    })
+    
+    # Convert list to data frame
+    extracted_df <- do.call(rbind, extracted_data)
+
+    # Create tibble for collected data
+    articles_df <- tibble(
+      source = "BBC News",
+      author = extracted_df[, 5],
+      headline = headlines,
+      category = extracted_df[, 1], 
+      date = extracted_df[, 3],
+      time = extracted_df[, 4],
+      text = extracted_df[, 2],
+      link = links,
+    )
+    
+    all_articles <- append(all_articles, list(articles_df))
+  }
+  
+  # Combine all data frames into one
+  final_df <- do.call(rbind, all_articles)
+  return(final_df)
+}
+```
+
+```{r}
+
+ # Function to fetch and parse JSON data from Reddit
+ fetch_reddit_data <- function(url) {
+   response <- GET(paste0(url, ".json"), config = add_headers("User-Agent" = "Mozilla/5.0"))
+
+   if (http_type(response) != "application/json") {
+     stop("Invalid response: Not JSON")
+   }
+
+   data <- content(response, as = "parsed", type = "application/json")
+    # print(data)
+   if (!is.list(data) || length(data) < 2 || !"data" %in% names(data[[1]])) {
+     stop("Unexpected JSON format")
+   }
+
+   return(data)
+ }
+
+ # Function to extract thread metadata and comments
+ gather_reddit_content <- function(json, url) {
+   if (is.null(json) || length(json) < 1) {
+     return(list(thread = tibble(), comments = tibble()))
+   }
+
+   thread <- json[[1]]$data$children[[1]]$data
+
+   thread_metadata <- tibble(
+     link = url,
+     author = thread$author,
+     title = thread$title,
+     text = ifelse(is.null(thread$selftext), "", thread$selftext),
+     score = thread$score,
+     comments = thread$num_comments,
+     upvotes = thread$ups
+   )
+
+   if (length(json) < 2) return(list(thread = thread_metadata, comments = tibble()))
+
+   comments_list <- json[[2]]$data$children
+
+   if (length(comments_list) == 0) return(list(thread = thread_metadata, comments = tibble()))
+
+   comments_df <- tibble(
+     link = url,
+     author = sapply(comments_list, function(x) tryCatch(x$data$author, error = function(e) NA)),
+     comment = sapply(comments_list, function(x) tryCatch(x$data$body, error = function(e) NA)),
+     score = sapply(comments_list, function(x) tryCatch(x$data$score, error = function(e) NA))
+   )
+
+   return(list(thread = thread_metadata, comments = comments_df))
+ }
+
+ # Function to get thread and comments
+ get_reddit_content <- function(url) {
+   json_data <- fetch_reddit_data(url)
+   return(gather_reddit_content(json_data, url))
+ }
+
+ # Function to scrape multiple threads from a subreddit
+ scrape_reddit <- function(subreddit, n_threads = 10) {
+   results <- list()
+
+   for (sub in subreddit) {
+     url <- paste0("https://www.reddit.com/r/", sub, "/.json")
+
+     response <- GET(url, config = add_headers("User-Agent" = "Mozilla/5.0"))
+
+     if (http_status(response)$category != "Success") {
+       warning(paste("Failed to fetch Reddit threads for", sub))
+       next
+     }
+
+     data <- content(response, as = "parsed")
+
+     threads <- lapply(data$data$children, function(thread) {
+       thread_data <- thread$data
+       thread_url <- paste0("https://www.reddit.com", thread_data$permalink)
+
+       thread_content <- tryCatch(
+         get_reddit_content(thread_url),
+         error = function(e) {
+           warning(paste("Could not fetch thread details:", thread_url))
+         return(NULL)
+         }
+       )
+
+       if (is.null(thread_content)) return(NULL)
+
+       post_time <- as.POSIXct(thread_data$created_utc, origin = Sys.time(), tz = "UTC")
+       date_part <- format(post_time, "%Y-%m-%d")  # Extract date
+       time_part <- format(post_time, "%H:%M:%S")
+
+       tibble(
+        source = "Reddit",
+        author = thread_data$author,
+        headline = thread_data$title,
+        category = sub,
+        date = date_part, # Added field for post time
+        time = time_part,
+        text = as.character(extract_longest_comment(thread_content$comments)),
+        link = thread_url,
+      )
+     })
+
+     results[[sub]] <- bind_rows(threads)
+   }
+
+   return(bind_rows(results))
+ }
+
+```
+
+```{r warning=FALSE}
+bbc_data <- scrape_bbc_news()
+
+reddit_data <- scrape_reddit(c("technology", "science", "worldnews", "programming"))
+
+bbc_data$category <- as.character(bbc_data$category)
+reddit_data$category <- as.character(reddit_data$category)
+
+bbc_data$text <- as.character(bbc_data$text)
+reddit_data$text <- as.character(reddit_data$text)
+
+bbc_data$author <- as.character(bbc_data$author)
+reddit_data$author <- as.character(reddit_data$author)
+
+bbc_data$date <- as.character(bbc_data$date)
+reddit_data$date <- as.character(reddit_data$date)
+
+bbc_data$time <- as.character(bbc_data$time)
+reddit_data$time <- as.character(reddit_data$time)
+
+all_data <- bind_rows(bbc_data, reddit_data)
+View(all_data)
+write.csv(all_data, "D:/VIT/collected_data_new_1.csv", row.names = FALSE)
+```
+
+```{r}
+df <- read.csv("D:/VIT/collected_data_new_1.csv",stringsAsFactors = FALSE)
+View(df)
+str(df)
+head(df)
+summary(df)
+dim(df)
+colnames(df)
+colSums(is.na(df))
+sapply(df, class)
+table(df$category)
+table(df$source)
+```
+
+# Structure
+
+```{r}
+ggplot(df, aes(x = category)) +
+  geom_bar(fill = "steelblue") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "Distribution of News Categories", x = "Category", y = "Count")
+```
+
+```{r}
+df$category <- as.factor(df$category)
+df$source <- as.factor(df$source)
+str(df)
+```
+
+# Cleaning
+
+```{r}
+df$text <- stri_encode(df$text, "", "UTF-8")
+encoding_issues <- which(is.na(stri_encode(df$text, "", "UTF-8")))
+df <- df[!duplicated(df), ]
+# df$headline[is.na(df$headline)] <- "Unknown"
+df <- df %>% drop_na(link)
+df <- df %>% drop_na(text)
+df <- df %>% drop_na(category)
+df <- df %>% drop_na(date)
+df <- df %>% drop_na(time)
+
+print(sum(is.na(df$category)))
+
+df$text[df$author == ""] <- NA
+df <- df %>% drop_na(author)
+
+df <- df %>% drop_na(category)
+df <- df %>% mutate(across(where(is.character), str_trim))
+df$domain <- gsub("https?://([^/]+)/.*", "\\1", df$link)
+head(df)
+View(df)
+write.csv(df, "enriched_data_1.csv", row.names = FALSE)
+```
+
+# Enrich
+
+```{r}
+df_filtered <- df %>% filter(!is.na(text) & text != "Not Available")
+df_filtered$word_count <- str_count(df_filtered$text, "\\S+")
+df_filtered$sentiment_score <- get_sentiment(df_filtered$text, method = "bing")
+df_filtered <- df_filtered %>% drop_na(category)
+
+head(df_filtered)
+View(df_filtered)
+summary(df_filtered$sentiment_score)
+write.csv(df_filtered, "enriched_data_new_1.csv", row.names = FALSE)
+
+```
+
+# Validate
+
+```{r}
+df_tokens <- df_filtered %>%
+  unnest_tokens(word, text) %>%
+  count(word, sort = TRUE) %>%
+  anti_join(stop_words, by = "word")
+
+df_tfidf <- df_tokens %>%
+  bind_tf_idf(word, word, n) %>%
+  arrange(desc(tf_idf))
+
+get_top_keywords <- function(text, n = 5) {
+  words <- unlist(strsplit(text, "\\s+"))
+  words <- words[words %in% df_tfidf$word]
+  top_words <- head(words, n)
+  paste(top_words, collapse = ", ")
+}
+
+df_filtered$keywords <- sapply(df_filtered$text, get_top_keywords)
+colSums(is.na(df_filtered))
+sum(duplicated(df_filtered))
+write.csv(df_filtered, "enriched_data_1.csv", row.names = FALSE)
+```
+
+```{r}
+colSums(is.na(df_filtered))
+sum(duplicated(df_filtered))
+table(df_filtered$category)
+summary(df_filtered)
+```
